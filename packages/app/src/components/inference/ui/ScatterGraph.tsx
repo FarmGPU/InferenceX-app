@@ -4,13 +4,13 @@ import { track } from '@/lib/analytics';
 import * as d3 from 'd3';
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 
-import { GRADIENT_NUDGE_EVENT } from '@/components/gradient-label-nudge';
+import { GRADIENT_NUDGE_EVENT } from '@/lib/nudges/registry';
 import { useInference } from '@/components/inference/InferenceContext';
 import ChartLegend from '@/components/ui/chart-legend';
 import { useUnofficialRun } from '@/components/unofficial-run-provider';
 import { computeToggle } from '@/hooks/useTogglableSet';
 import { getHardwareConfig, getModelSortIndex } from '@/lib/constants';
-import { getModelWatermark } from '@/lib/data-mappings';
+import { getChartWatermark, getPrecisionLabel, type Precision } from '@/lib/data-mappings';
 import { formatNumber, getDisplayLabel, updateRepoUrl } from '@/lib/utils';
 import { D3Chart } from '@/lib/d3-chart/D3Chart';
 import type {
@@ -43,6 +43,7 @@ import {
   paretoFrontUpperLeft,
   paretoFrontUpperRight,
 } from '@/lib/chart-utils';
+import { type RooflineDirection, getSpeedOverlayCorners } from '@/lib/speed-overlay';
 import type {
   ChartDefinition,
   InferenceData,
@@ -100,6 +101,14 @@ const parseHwKeyToLabel = (hwKey: string): { name: string; label: string } => {
   return { name: config.label, label: getDisplayLabel(config) };
 };
 
+// Line-label text for a curve. When more than one precision is shown, each curve
+// is its own line, so append the precision (e.g. "B200 (vLLM) FP8") to keep the
+// FP4 and FP8 curves of the same hardware distinguishable.
+const lineLabelText = (hwKey: string, precision: string, includePrecision: boolean): string => {
+  const base = parseHwKeyToLabel(hwKey).label;
+  return includePrecision ? `${base} ${getPrecisionLabel(precision as Precision)}` : base;
+};
+
 const ScatterGraph = React.memo(
   ({
     chartId,
@@ -111,6 +120,8 @@ const ScatterGraph = React.memo(
     showAllHardwareTypes = false,
     hardwareConfigOverride,
     overlayData,
+    transitionDuration = 750,
+    niceAxes = true,
   }: ScatterGraphProps) => {
     const {
       activeHwTypes,
@@ -118,7 +129,6 @@ const ScatterGraph = React.memo(
       toggleHwType,
       removeHwType,
       hwTypesWithData,
-      selectedModel,
       selectedPrecisions,
       selectedYAxisMetric,
       availableRuns,
@@ -141,6 +151,10 @@ const ScatterGraph = React.memo(
       setShowGradientLabels,
       showLineLabels,
       setShowLineLabels,
+      showSpeedOverlay,
+      setShowSpeedOverlay,
+      showMinecraftOverlay,
+      setShowMinecraftOverlay,
       trackedConfigs,
       addTrackedConfig,
       removeTrackedConfig,
@@ -443,10 +457,10 @@ const ScatterGraph = React.memo(
       return {
         type: (useLog ? 'log' : 'linear') as 'log' | 'linear',
         domain,
-        nice: true,
+        nice: niceAxes,
         _isLog: useLog,
       };
-    }, [visiblePoints, isInputTputMetric, xLabel, scaleType]);
+    }, [visiblePoints, isInputTputMetric, xLabel, scaleType, niceAxes]);
 
     const yScaleConfig = useMemo(() => {
       const ext =
@@ -468,9 +482,9 @@ const ScatterGraph = React.memo(
       return {
         type: (useLog ? 'log' : 'linear') as 'log' | 'linear',
         domain: [yMin, ext[1] * 1.05] as [number, number],
-        nice: true,
+        nice: niceAxes,
       };
-    }, [visiblePoints, isInputTputMetric, logScale]);
+    }, [visiblePoints, isInputTputMetric, logScale, niceAxes]);
 
     // --- Axis configs ---
     const xAxisConfig = useMemo(
@@ -525,7 +539,9 @@ const ScatterGraph = React.memo(
           .selectAll<SVGGElement, InferenceData>('.dot-group')
           .transition('legend-hover')
           .duration(150)
-          .style('opacity', (d) => (!isPointVisible(d) ? 0 : String(d.hwKey) === hwKey ? 1 : 0.15));
+          .style('opacity', (d) =>
+            isPointVisible(d) ? (String(d.hwKey) === hwKey ? 1 : 0.15) : 0,
+          );
         root
           .selectAll<SVGPathElement, unknown>('.roofline-path')
           .transition('legend-hover')
@@ -906,6 +922,9 @@ const ScatterGraph = React.memo(
 
           if (showLineLabels) {
             const isInteractivity = chartDefinition.chartType === 'interactivity';
+            // With >1 precision selected each precision is its own curve, so label
+            // every curve and include the precision in the text.
+            const multiPrecision = selectedPrecisions.length > 1;
             const LABEL_H = 18;
             const LABEL_W = 120; // approximate label width for overlap check
 
@@ -916,16 +935,19 @@ const ScatterGraph = React.memo(
               const collides = (cx: number, cy: number) =>
                 placed.some((p) => Math.abs(p.y - cy) < LABEL_H && Math.abs(p.x - cx) < LABEL_W);
 
-              // Deduplicate by hw key — pick the roofline with most points per hw
-              const bestByHw = new Map<string, (typeof entries)[0]>();
+              // Deduplicate by group key — one label per curve. With a single
+              // precision that's one per hw; with multiple it's one per (hw,
+              // precision) so each precision curve keeps its own label.
+              const bestByGroup = new Map<string, (typeof entries)[0]>();
               for (const e of entries) {
                 if (!e.visible || e.points.length < 2) continue;
-                const prev = bestByHw.get(e.hw);
-                if (!prev || e.points.length > prev.points.length) bestByHw.set(e.hw, e);
+                const groupKey = multiPrecision ? e.key : e.hw;
+                const prev = bestByGroup.get(groupKey);
+                if (!prev || e.points.length > prev.points.length) bestByGroup.set(groupKey, e);
               }
 
               // Sort entries by highest y-value first (top of chart) for priority
-              const sorted = [...bestByHw.values()].toSorted((a, b) => {
+              const sorted = [...bestByGroup.values()].toSorted((a, b) => {
                 const ay = yScale(a.points[0].y);
                 const by = yScale(b.points[0].y);
                 return ay - by; // smaller pixel y = higher on chart
@@ -940,7 +962,7 @@ const ScatterGraph = React.memo(
                   pts.at(-1)!, // endpoint
                 ];
 
-                const { label } = parseHwKeyToLabel(entry.hw);
+                const label = lineLabelText(entry.hw, entry.precision, multiPrecision);
                 let foundPlacement = false;
                 for (const pt of candidates) {
                   const px = xScale(pt.x);
@@ -975,39 +997,134 @@ const ScatterGraph = React.memo(
                 }
               }
 
-              // Also add hidden entries for non-visible hw (so D3 data-join is clean)
-              const labeledHw = new Set(lineLabels.map((l) => l.hw));
+              // Also add hidden entries for any curve that wasn't placed (so the
+              // D3 data-join, keyed by series key, is clean).
+              const labeledKeys = new Set(lineLabels.map((l) => l.key));
               for (const entry of entries) {
-                if (entry.points.length >= 2 && !labeledHw.has(entry.hw)) {
-                  const { label } = parseHwKeyToLabel(entry.hw);
+                if (entry.points.length >= 2 && !labeledKeys.has(entry.key)) {
                   lineLabels.push({
                     key: entry.key,
                     hw: entry.hw,
-                    label,
+                    label: lineLabelText(entry.hw, entry.precision, multiPrecision),
                     color: getCssColor(resolveColor(entry.hw)),
                     x: xScale(entry.points[0].x),
                     y: yScale(entry.points[0].y),
                     visible: false,
                   });
-                  labeledHw.add(entry.hw);
+                  labeledKeys.add(entry.key);
+                }
+              }
+
+              // Overlay (unofficial run) rooflines also get line labels using the
+              // run-palette color so they match the legend swatches. The label
+              // text mirrors the overlay legend ("✕ <branch>" — falls back to the
+              // hw label if run metadata isn't available, e.g. legacy callers).
+              const overlayLabelText = (
+                runIndex: number,
+                hwKey: string,
+                precision: string,
+              ): string => {
+                const info = unofficialRunInfos[runIndex];
+                const base = info
+                  ? `✕ ${info.branch || `run ${info.id}`}`
+                  : parseHwKeyToLabel(hwKey).label;
+                return multiPrecision
+                  ? `${base} ${getPrecisionLabel(precision as Precision)}`
+                  : base;
+              };
+              const sortedOverlay = Object.entries(overlayRooflines)
+                .filter(
+                  ([, group]) => activeOverlayHwTypes.has(group.hwKey) && group.points.length >= 2,
+                )
+                .toSorted(([, a], [, b]) => yScale(a.points[0].y) - yScale(b.points[0].y));
+
+              for (const [ovKey, group] of sortedOverlay) {
+                const labelKey = `overlay-${ovKey}`;
+                const pts = group.points;
+                const candidates = [
+                  pts[Math.min(1, pts.length - 1)],
+                  pts[Math.floor(pts.length / 2)],
+                  pts[Math.max(0, Math.floor((pts.length * 2) / 3))],
+                  pts.at(-1)!,
+                ];
+                const label = overlayLabelText(
+                  group.runIndex,
+                  group.hwKey,
+                  group.points[0]?.precision ?? '',
+                );
+                let placedOverlay = false;
+                for (const pt of candidates) {
+                  const px = xScale(pt.x);
+                  const py = yScale(pt.y);
+                  if (!collides(px, py)) {
+                    lineLabels.push({
+                      key: labelKey,
+                      hw: group.hwKey,
+                      label,
+                      color: overlayRunColor(group.runIndex),
+                      x: px,
+                      y: py,
+                      visible: true,
+                    });
+                    placed.push({ x: px, y: py });
+                    placedOverlay = true;
+                    break;
+                  }
+                }
+                if (!placedOverlay) {
+                  const pt = pts[0];
+                  lineLabels.push({
+                    key: labelKey,
+                    hw: group.hwKey,
+                    label,
+                    color: overlayRunColor(group.runIndex),
+                    x: xScale(pt.x),
+                    y: yScale(pt.y),
+                    visible: false,
+                  });
                 }
               }
             } else {
-              // TTFT / E2EL: endpoint labels, one per hw key
-              const seenHw = new Set<string>();
+              // TTFT / E2EL: endpoint labels, one per curve (per hw, or per
+              // (hw, precision) when multiple precisions are shown).
+              const seen = new Set<string>();
               for (const entry of entries) {
-                if (entry.points.length < 2 || seenHw.has(entry.hw)) continue;
-                seenHw.add(entry.hw);
+                if (entry.points.length < 2 || !entry.visible) continue;
+                const groupKey = multiPrecision ? entry.key : entry.hw;
+                if (seen.has(groupKey)) continue;
+                seen.add(groupKey);
                 const pt = entry.points.at(-1)!;
-                const { label } = parseHwKeyToLabel(entry.hw);
                 lineLabels.push({
                   key: entry.key,
                   hw: entry.hw,
-                  label,
+                  label: lineLabelText(entry.hw, entry.precision, multiPrecision),
                   color: getCssColor(resolveColor(entry.hw)),
                   x: xScale(pt.x),
                   y: yScale(pt.y),
-                  visible: entry.visible,
+                  visible: true,
+                });
+              }
+              // Endpoint labels for overlay rooflines too (one per (hw, runIndex)),
+              // labeled with the run's branch name to mirror the overlay legend.
+              for (const [ovKey, group] of Object.entries(overlayRooflines)) {
+                if (group.points.length < 2 || !activeOverlayHwTypes.has(group.hwKey)) continue;
+                const info = unofficialRunInfos[group.runIndex];
+                const branchOrHw = info
+                  ? `✕ ${info.branch || `run ${info.id}`}`
+                  : parseHwKeyToLabel(group.hwKey).label;
+                const labelText = multiPrecision
+                  ? `${branchOrHw} ${getPrecisionLabel((group.points[0]?.precision ?? '') as Precision)}`
+                  : branchOrHw;
+                const labelKey = `overlay-${ovKey}`;
+                const pt = group.points.at(-1)!;
+                lineLabels.push({
+                  key: labelKey,
+                  hw: group.hwKey,
+                  label: labelText,
+                  color: overlayRunColor(group.runIndex),
+                  x: xScale(pt.x),
+                  y: yScale(pt.y),
+                  visible: true,
                 });
               }
               const visible = lineLabels.filter((l) => l.visible);
@@ -1149,6 +1266,7 @@ const ScatterGraph = React.memo(
           // Update line label positions on zoom
           if (showLineLabels) {
             const isInteractivity = chartDefinition.chartType === 'interactivity';
+            const multiPrecision = selectedPrecisions.length > 1;
             const LABEL_H = 18;
             const LABEL_W = 120;
 
@@ -1158,17 +1276,19 @@ const ScatterGraph = React.memo(
               const collides = (cx: number, cy: number) =>
                 placed.some((p) => Math.abs(p.y - cy) < LABEL_H && Math.abs(p.x - cx) < LABEL_W);
 
-              // Deduplicate by hw key — pick roofline with most points per hw
-              const bestByHw = new Map<string, [string, InferenceData[]]>();
+              // Deduplicate by group key — one curve per hw, or per (hw, precision)
+              // when multiple precisions are shown (mirrors the static render).
+              const bestByGroup = new Map<string, [string, InferenceData[]]>();
               for (const [key, pts] of Object.entries(rooflines)) {
                 if (pts.length < 2) continue;
                 const hw = key.split('_').slice(0, -1).join('_');
                 const prec = key.split('_').pop()!;
                 if (!effectiveActiveHwTypes.has(hw) || !selectedPrecisions.includes(prec)) continue;
-                const prev = bestByHw.get(hw);
-                if (!prev || pts.length > prev[1].length) bestByHw.set(hw, [key, pts]);
+                const groupKey = multiPrecision ? key : hw;
+                const prev = bestByGroup.get(groupKey);
+                if (!prev || pts.length > prev[1].length) bestByGroup.set(groupKey, [key, pts]);
               }
-              const visibleEntries = [...bestByHw.values()].toSorted(
+              const visibleEntries = [...bestByGroup.values()].toSorted(
                 ([, a], [, b]) => newYScale(a[0].y) - newYScale(b[0].y),
               );
 
@@ -1200,6 +1320,43 @@ const ScatterGraph = React.memo(
                 }
               }
 
+              // Overlay (unofficial) rooflines: same greedy placement against
+              // the same `placed` array so they stay non-overlapping with the
+              // official labels post-zoom.
+              const overlayVisible = Object.entries(overlayRooflines)
+                .filter(
+                  ([, group]) => activeOverlayHwTypes.has(group.hwKey) && group.points.length >= 2,
+                )
+                .toSorted(([, a], [, b]) => newYScale(a.points[0].y) - newYScale(b.points[0].y));
+              for (const [ovKey, group] of overlayVisible) {
+                const labelKey = `overlay-${ovKey}`;
+                const pts = group.points;
+                const candidates = [
+                  pts[Math.min(1, pts.length - 1)],
+                  pts[Math.floor(pts.length / 2)],
+                  pts[Math.max(0, Math.floor((pts.length * 2) / 3))],
+                  pts.at(-1)!,
+                ];
+                let found = false;
+                for (const pt of candidates) {
+                  const px = newXScale(pt.x);
+                  const py = newYScale(pt.y);
+                  if (!collides(px, py)) {
+                    zoomResults.set(labelKey, { x: px, y: py, vis: true });
+                    placed.push({ x: px, y: py });
+                    found = true;
+                    break;
+                  }
+                }
+                if (!found) {
+                  zoomResults.set(labelKey, {
+                    x: newXScale(pts[0].x),
+                    y: newYScale(pts[0].y),
+                    vis: false,
+                  });
+                }
+              }
+
               zoomGroup.selectAll<SVGGElement, unknown>('.line-label').each(function () {
                 const el = d3.select(this);
                 const k = el.attr('data-line-key');
@@ -1219,15 +1376,28 @@ const ScatterGraph = React.memo(
                 y: number;
               }
               const zoomLabels: ZoomLabel[] = [];
-              const seenHw = new Set<string>();
+              const seen = new Set<string>();
               Object.entries(rooflines).forEach(([key, pts]) => {
                 if (pts.length < 2) return;
                 const hw = key.split('_').slice(0, -1).join('_');
-                if (seenHw.has(hw)) return;
-                seenHw.add(hw);
+                const prec = key.split('_').pop()!;
+                if (!effectiveActiveHwTypes.has(hw) || !selectedPrecisions.includes(prec)) return;
+                const groupKey = multiPrecision ? key : hw;
+                if (seen.has(groupKey)) return;
+                seen.add(groupKey);
                 const pt = pts.at(-1)!;
                 zoomLabels.push({ key, x: newXScale(pt.x), y: newYScale(pt.y) });
               });
+              // Overlay rooflines: per-(hw, runIndex) endpoint labels.
+              for (const [ovKey, group] of Object.entries(overlayRooflines)) {
+                if (group.points.length < 2 || !activeOverlayHwTypes.has(group.hwKey)) continue;
+                const pt = group.points.at(-1)!;
+                zoomLabels.push({
+                  key: `overlay-${ovKey}`,
+                  x: newXScale(pt.x),
+                  y: newYScale(pt.y),
+                });
+              }
               if (zoomLabels.length > 1) {
                 const yRange = newYScale.range();
                 const top = Math.min(yRange[0], yRange[1]) + LABEL_H;
@@ -1424,7 +1594,7 @@ const ScatterGraph = React.memo(
 
                   tooltip.html(generateOverlayTooltipContent(createOverlayConfig(d, false)));
                 })
-                .on('mousemove', function (event) {
+                .on('mousemove', (event) => {
                   if (chartRef.current?.isPinned()) return;
                   const [mx, my] = d3.pointer(event, container);
                   const pos = computeTooltipPosition(mx, my, tooltip, container);
@@ -1437,7 +1607,7 @@ const ScatterGraph = React.memo(
                   tooltip.style('opacity', 0).style('display', 'none');
                   zoomGroup.select('.ruler-group').style('display', 'none');
                 })
-                .on('click', function (event, d) {
+                .on('click', (event, d) => {
                   event.stopPropagation();
                   const [mx, my] = d3.pointer(event, container);
                   tooltip.html(generateOverlayTooltipContent(createOverlayConfig(d, true)));
@@ -1491,14 +1661,116 @@ const ScatterGraph = React.memo(
           }
         : null;
 
+      const speedOverlayLayer: CustomLayerConfig = {
+        type: 'custom',
+        key: 'speed-overlay',
+        render: (_zoomGroup, ctx) => {
+          const { g } = ctx.layout;
+          g.selectAll('.speed-overlay').remove();
+          if (!showSpeedOverlay && !showMinecraftOverlay) return;
+          const w = ctx.width;
+          const h = ctx.height;
+          const SIZE = 78;
+          const PAD = 8;
+          const STACK_GAP = 4;
+          const rooflineKey = `${selectedYAxisMetric}_roofline` as keyof ChartDefinition;
+          const dir = chartDefinition[rooflineKey] as RooflineDirection | undefined;
+          const { busTop, busLeft } = getSpeedOverlayCorners(dir);
+          const layer = g.append('g').attr('class', 'speed-overlay').attr('pointer-events', 'none');
+
+          // Each enabled "pair" stacks horizontally inward from the chart corner so
+          // the second pair sits next to (not on top of) the first one when both
+          // toggles are on. The bus-side stays anchored to the batch corner; the
+          // car-side stays anchored to the interactive corner. Pair items can have
+          // independent slow/fast sizes so the donkey can be visually heavier than
+          // the elytra without affecting the bus/car pair.
+          interface OverlayPair {
+            id: string;
+            slowSrc: string;
+            fastSrc: string;
+            slowSize: number;
+            fastSize: number;
+          }
+          const enabledPairs: OverlayPair[] = [];
+          if (showSpeedOverlay) {
+            enabledPairs.push({
+              id: 'speed',
+              slowSrc: '/decorative/bus.png',
+              fastSrc: '/decorative/racing-car.png',
+              slowSize: SIZE,
+              fastSize: SIZE,
+            });
+          }
+          if (showMinecraftOverlay) {
+            // donkey-chest.png — Chested_Donkey_JE5 from minecraft.wiki/w/Donkey,
+            //   rendered 50% larger than the other overlay icons (1.5× SIZE).
+            // elytra.png — ElytraNew sprite (front-facing both wings) from the
+            //   Minecraft Fandom wiki at 160×160 pixel-art.
+            enabledPairs.push({
+              id: 'minecraft',
+              slowSrc: '/decorative/donkey-chest.png',
+              fastSrc: '/decorative/elytra.png',
+              slowSize: Math.round(SIZE * 1.5),
+              fastSize: SIZE,
+            });
+          }
+
+          const slowCornerName = `${busTop ? 'top' : 'bottom'}-${busLeft ? 'left' : 'right'}`;
+          const fastCornerName = `${busTop ? 'bottom' : 'top'}-${busLeft ? 'right' : 'left'}`;
+          let slowInward = 0;
+          let fastInward = 0;
+          enabledPairs.forEach((pair) => {
+            const slowX = busLeft ? PAD + slowInward : w - pair.slowSize - PAD - slowInward;
+            const slowY = busTop ? PAD : h - pair.slowSize - PAD;
+            const fastX = busLeft ? w - pair.fastSize - PAD - fastInward : PAD + fastInward;
+            const fastY = busTop ? h - pair.fastSize - PAD : PAD;
+            layer
+              .append('image')
+              .attr('class', `speed-overlay-slow speed-overlay-${pair.id}-slow`)
+              .attr('data-testid', `speed-overlay-${pair.id}-slow`)
+              .attr('data-corner', slowCornerName)
+              .attr('href', pair.slowSrc)
+              .attr('x', slowX)
+              .attr('y', slowY)
+              .attr('width', pair.slowSize)
+              .attr('height', pair.slowSize)
+              .attr('opacity', 0.85);
+            layer
+              .append('image')
+              .attr('class', `speed-overlay-fast speed-overlay-${pair.id}-fast`)
+              .attr('data-testid', `speed-overlay-${pair.id}-fast`)
+              .attr('data-corner', fastCornerName)
+              .attr('href', pair.fastSrc)
+              .attr('x', fastX)
+              .attr('y', fastY)
+              .attr('width', pair.fastSize)
+              .attr('height', pair.fastSize)
+              .attr('opacity', 0.85);
+            slowInward += pair.slowSize + STACK_GAP;
+            fastInward += pair.fastSize + STACK_GAP;
+          });
+
+          // Backwards-compatible aliases so existing E2E tests (speed-overlay.cy.ts)
+          // can still find the bus/car pair via `[data-testid="speed-overlay-bus"]`
+          // and `[data-testid="speed-overlay-car"]`.
+          if (showSpeedOverlay) {
+            layer.select('.speed-overlay-speed-slow').attr('data-testid', 'speed-overlay-bus');
+            layer.select('.speed-overlay-speed-fast').attr('data-testid', 'speed-overlay-car');
+          }
+        },
+      };
+
       const result: LayerConfig<InferenceData>[] = [rooflineLayer, scatterLayer];
       if (overlayLayer) result.push(overlayLayer);
+      result.push(speedOverlayLayer);
       return result;
     }, [
       rooflines,
       allPointLabelsByKey,
       showGradientLabels,
       showLineLabels,
+      showSpeedOverlay,
+      showMinecraftOverlay,
       gradientColorByPoint,
       chartId,
       effectiveActiveHwTypes,
@@ -1513,11 +1785,14 @@ const ScatterGraph = React.memo(
       overlayData,
       processedOverlayData,
       overlayRooflines,
+      activeOverlayHwTypes,
+      unofficialRunInfos,
       runIndexByUrl,
       hardwareConfig,
       xLabel,
       yLabel,
       selectedYAxisMetric,
+      chartDefinition,
       chartDefinition.chartType,
     ]);
 
@@ -1661,7 +1936,7 @@ const ScatterGraph = React.memo(
         chartId={chartId}
         data={chartScaleData}
         margin={CHART_MARGIN}
-        watermark={getModelWatermark(selectedModel, isUnofficialRun)}
+        watermark={getChartWatermark(isUnofficialRun)}
         testId="scatter-graph"
         grabCursor={true}
         caption={caption}
@@ -1672,7 +1947,7 @@ const ScatterGraph = React.memo(
         layers={layers}
         zoom={zoomConfig}
         tooltip={tooltipConfig}
-        transitionDuration={750}
+        transitionDuration={transitionDuration}
         onRender={onRender}
         noDataOverlay={
           filteredData.length === 0 && processedOverlayData.length === 0 ? (
@@ -1771,8 +2046,9 @@ const ScatterGraph = React.memo(
               track('latency_legend_expanded', { expanded });
             }}
             switches={[
-              ...(selectedYAxisMetric !== 'y_inputTputPerGpu'
-                ? [
+              ...(selectedYAxisMetric === 'y_inputTputPerGpu'
+                ? []
+                : [
                     {
                       id: 'scatter-log-scale',
                       label: 'Log Scale',
@@ -1782,8 +2058,7 @@ const ScatterGraph = React.memo(
                         track('latency_log_scale_toggled', { enabled: checked });
                       },
                     },
-                  ]
-                : []),
+                  ]),
               {
                 id: 'scatter-hide-non-optimal',
                 label: 'Optimal Only',
@@ -1852,6 +2127,24 @@ const ScatterGraph = React.memo(
                 onCheckedChange: (checked: boolean) => {
                   setShowLineLabels(checked);
                   track('latency_line_labels_toggled', { enabled: checked });
+                },
+              },
+              {
+                id: 'scatter-speed-overlay',
+                label: 'Bus / Race Car',
+                checked: showSpeedOverlay,
+                onCheckedChange: (checked: boolean) => {
+                  setShowSpeedOverlay(checked);
+                  track('latency_speed_overlay_toggled', { enabled: checked });
+                },
+              },
+              {
+                id: 'scatter-minecraft-overlay',
+                label: 'Donkey / Elytra',
+                checked: showMinecraftOverlay,
+                onCheckedChange: (checked: boolean) => {
+                  setShowMinecraftOverlay(checked);
+                  track('latency_minecraft_overlay_toggled', { enabled: checked });
                 },
               },
             ]}

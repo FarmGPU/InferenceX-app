@@ -13,7 +13,11 @@ import {
 
 import { DISPLAY_MODEL_TO_DB, islOslToSequence } from '@semianalysisai/inferencex-constants';
 import { track } from '@/lib/analytics';
-import { FAVORITE_PRESETS, type FavoritePreset } from '@/components/favorites/favorite-presets';
+import {
+  FAVORITE_PRESETS,
+  type FavoritePreset,
+  matchesPresetHwFilter,
+} from '@/components/favorites/favorite-presets';
 
 import { useGlobalFilters } from '@/components/GlobalFilterContext';
 import type {
@@ -39,12 +43,17 @@ import {
 import { useUrlState } from '@/hooks/useUrlState';
 import { buildAvailabilityHwKey } from '@/lib/chart-utils';
 import { getHardwareConfig, getModelSortIndex, isKnownGpu, TABLEAU_10 } from '@/lib/constants';
-import { hasMtpEngineExclusion, MODEL_PREFIX_MAPPING } from '@/lib/data-mappings';
+import { getModelExclusion, MODEL_PREFIX_MAPPING } from '@/lib/data-mappings';
 import {
   MtpEngineConflictToast,
   type MtpEngineConflictDetail,
 } from '@/components/mtp-engine-conflict-toast';
-import { clearAllMtpFamilies, resolveMtpToggle } from '@/lib/mtp-exclusion';
+import {
+  buildExclusion,
+  clearAllExclusionGroups,
+  effectiveLegendItems,
+  resolveExclusionToggle,
+} from '@/lib/exclusion';
 import { filterRunsByModel, getDisplayLabel } from '@/lib/utils';
 
 import { useChartData } from './hooks/useChartData';
@@ -55,11 +64,34 @@ export const InferenceContext = createContext<InferenceChartContextType | undefi
 export function InferenceProvider({
   children,
   activeTab,
+  initialActiveHwTypes,
+  compareGpuPair,
+  initialYAxisMetric,
 }: {
   children: ReactNode;
   activeTab: string;
+  /**
+   * Initial legend filter (activeHwTypes) when the URL has no `i_active` param.
+   * Used by `/compare/[a]-vs-[b]` pages to focus the chart on the two GPUs from
+   * the slug. Series for other GPUs are omitted — only matching hw keys remain.
+   */
+  initialActiveHwTypes?: string[];
+  /**
+   * When set (canonical `/compare` pages), benchmark data is filtered to these two
+   * registry GPU base keys so other hardware never appears on the legend or plots.
+   */
+  compareGpuPair?: readonly [string, string];
+  /**
+   * Initial y-axis metric key when the URL has no `?i_metric=` param. Used by
+   * `/compare-per-dollar/[slug]` to default the chart to
+   * `y_costh` (Cost per Million Total Tokens — Owning Hyperscaler) instead of
+   * the dashboard's default `y_tpPerGpu`. URL param still wins so existing
+   * shared links are unaffected.
+   */
+  initialYAxisMetric?: string;
 }) {
-  const isActive = activeTab === 'inference' || activeTab === 'historical';
+  const isActive =
+    activeTab === 'inference' || activeTab === 'historical' || activeTab === 'compare';
 
   const {
     selectedModel,
@@ -107,7 +139,7 @@ export function InferenceProvider({
     return urlGpus ? urlGpus.split(',').filter(Boolean) : [];
   });
   const [selectedYAxisMetric, setSelectedYAxisMetric] = useState<string>(
-    () => getUrlParam('i_metric') || 'y_tpPerGpu',
+    () => getUrlParam('i_metric') || initialYAxisMetric || 'y_tpPerGpu',
   );
   const [selectedXAxisMetric, setSelectedXAxisMetric] = useState<string | null>(
     () => getUrlParam('i_xmetric') || 'p99_ttft',
@@ -132,6 +164,10 @@ export function InferenceProvider({
     () => getUrlParam('i_gradlabel') === '1',
   );
   const [showLineLabels, setShowLineLabels] = useState(() => getUrlParam('i_linelabel') === '1');
+  const [showSpeedOverlay, setShowSpeedOverlay] = useState(() => getUrlParam('i_speed') === '1');
+  const [showMinecraftOverlay, setShowMinecraftOverlay] = useState(
+    () => getUrlParam('i_mc') === '1',
+  );
   const [userCosts, setUserCosts] = useState<Record<string, number | undefined> | null>(null);
   const [userPowers, setUserPowers] = useState<Record<string, number | undefined> | null>(null);
 
@@ -144,6 +180,20 @@ export function InferenceProvider({
   // Persists the preset's desired hw filter beyond pendingHwFilter consumption.
   // Cleared when the user manually changes filters (clearing the preset).
   const presetHwFilterRef = useRef<string[] | null>(null);
+
+  // Pending legend-active selection restored from `i_active` URL param.
+  // Consumed once when hwTypesWithData first populates (see effect below).
+  const [pendingActiveHwTypes, setPendingActiveHwTypes] = useState<Set<string> | null>(() => {
+    const v = getUrlParam('i_active');
+    if (v) {
+      const set = new Set(v.split(',').filter(Boolean));
+      return set.size > 0 ? set : null;
+    }
+    if (initialActiveHwTypes && initialActiveHwTypes.length > 0) {
+      return new Set(initialActiveHwTypes);
+    }
+    return null;
+  });
 
   // --- MTP cross-engine conflict toast state ---
   const [mtpConflict, setMtpConflict] = useState<MtpEngineConflictDetail | null>(null);
@@ -172,6 +222,7 @@ export function InferenceProvider({
     effectiveRunDate,
     isActive,
     latestDate,
+    compareGpuPair ?? null,
   );
 
   // For GPU comparison date picker — use shared availability data from global filters
@@ -288,7 +339,7 @@ export function InferenceProvider({
   const presetGuardRef = useRef(false);
   const clearPresetOnChange = useCallback(() => {
     if (presetGuardRef.current) return;
-    setActivePresetId((prev) => (prev !== null ? null : prev));
+    setActivePresetId((prev) => (prev === null ? prev : null));
     presetHwFilterRef.current = null;
   }, []);
   const setSelectedModelAndClear = useCallback(
@@ -375,6 +426,11 @@ export function InferenceProvider({
   // pendingHwFilter effect filters it down in the next — causing a flash/race.
   const pendingHwFilterRef = useRef(pendingHwFilter);
   pendingHwFilterRef.current = pendingHwFilter;
+  // Read selectedModel via a ref so the callback identity below stays stable —
+  // matchesPresetHwFilter only consults the model to gate the bare-prefix
+  // exclusion-suffix skip, and we want the current value at call time.
+  const selectedModelRef = useRef(selectedModel);
+  selectedModelRef.current = selectedModel;
   // Note: setActiveHwTypes is a useState dispatcher that accepts functional updaters,
   // but useChartToggleSet narrows the type to (set: Set<string>) => void.
   // We cast once here to allow passthrough of functional updaters from useChartDataFilter.
@@ -391,9 +447,9 @@ export function InferenceProvider({
       // Preset filter is active: evaluate updater to get all available items, then filter.
       // Passing empty set makes useChartDataFilter's updater return itemsWithData (all items).
       const base: Set<string> = typeof update === 'function' ? update(new Set()) : update;
-      const matchesHwFilter = (hwKey: string) =>
-        filter.some((f) => hwKey === f || (!f.includes('_') && hwKey.startsWith(`${f}_`)));
-      const filtered = new Set([...base].filter(matchesHwFilter));
+      const filtered = new Set(
+        [...base].filter((k) => matchesPresetHwFilter(k, filter, selectedModelRef.current)),
+      );
       if (filtered.size > 0) {
         setActiveHwTypes(filtered);
         setPendingHwFilter(null);
@@ -414,20 +470,30 @@ export function InferenceProvider({
   // but useChartDataFilter didn't fire (e.g. re-selecting the same preset).
   useEffect(() => {
     if (!pendingHwFilter || hwTypesWithData.size === 0) return;
-    const matchesHwFilter = (hwKey: string) =>
-      pendingHwFilter.some((f) => hwKey === f || (!f.includes('_') && hwKey.startsWith(`${f}_`)));
-    const filtered = new Set([...hwTypesWithData].filter(matchesHwFilter));
+    const filtered = new Set(
+      [...hwTypesWithData].filter((k) => matchesPresetHwFilter(k, pendingHwFilter, selectedModel)),
+    );
     if (filtered.size > 0) {
       setActiveHwTypes(filtered);
       setPendingHwFilter(null);
     }
   }, [pendingHwFilter, hwTypesWithData, setActiveHwTypes]);
 
-  const mtpExclusion = hasMtpEngineExclusion(selectedModel);
+  const exclusion = useMemo(() => {
+    const specs = getModelExclusion(selectedModel);
+    return specs.length > 0 ? buildExclusion(specs) : null;
+  }, [selectedModel]);
   const toggleHwType = useCallback(
     (hw: string) => {
-      if (mtpExclusion) {
-        const decision = resolveMtpToggle(activeHwTypes, hw, hwTypesWithData);
+      // Under exclusion, hide participating keys from inactive groups when
+      // computing the toggle "universe". This makes the default-deselected
+      // state (DSv4 MTP on first load) count as "all selected", so clicking a
+      // legend entry solos it instead of just removing it.
+      const toggleUniverse = exclusion
+        ? effectiveLegendItems(hwTypesWithData, activeHwTypes, exclusion)
+        : hwTypesWithData;
+      if (exclusion) {
+        const decision = resolveExclusionToggle(activeHwTypes, hw, toggleUniverse, exclusion);
         if (decision.kind === 'block') {
           setMtpConflict({
             kind: 'blocked',
@@ -443,11 +509,11 @@ export function InferenceProvider({
           return;
         }
       }
-      toggleHwRaw(hw, hwTypesWithData);
+      toggleHwRaw(hw, toggleUniverse);
       setActivePresetId(null);
       presetHwFilterRef.current = null;
     },
-    [toggleHwRaw, hwTypesWithData, mtpExclusion, activeHwTypes, setActiveHwTypes],
+    [toggleHwRaw, hwTypesWithData, exclusion, activeHwTypes, setActiveHwTypes],
   );
 
   const removeHwType = useCallback(
@@ -478,16 +544,16 @@ export function InferenceProvider({
   );
   const removeActiveDate = useCallback((id: string) => removeDateRaw(id), [removeDateRaw]);
   const selectAllHwTypes = useCallback(() => {
-    if (mtpExclusion) {
-      const { result, droppedFamilies } = clearAllMtpFamilies(hwTypesWithData);
+    if (exclusion) {
+      const { result, droppedGroups } = clearAllExclusionGroups(hwTypesWithData, exclusion);
       setActiveHwTypes(result);
-      if (droppedFamilies.length > 0) {
-        setMtpConflict({ kind: 'cleared', families: droppedFamilies });
+      if (droppedGroups.length > 0) {
+        setMtpConflict({ kind: 'cleared', families: droppedGroups });
       }
       return;
     }
     selectAllHwRaw(hwTypesWithData);
-  }, [selectAllHwRaw, hwTypesWithData, mtpExclusion, setActiveHwTypes]);
+  }, [selectAllHwRaw, hwTypesWithData, exclusion, setActiveHwTypes]);
   const selectAllActiveDates = useCallback(
     () => selectAllDatesRaw(allDateIds),
     [selectAllDatesRaw, allDateIds],
@@ -505,37 +571,93 @@ export function InferenceProvider({
   // bails on the empty-data tick and never re-fires, leaving the legend at the prior intersection.
   const precisionsKey = effectivePrecisions.join(',');
   const lastHwResetKeyRef = useRef('');
+
+  // Restore legend-active selection from URL on first availability of
+  // hwTypesWithData. Sets lastHwResetKeyRef so the reset effect below treats
+  // the current key as already-applied and bails. Empty intersection (e.g.
+  // shared GPUs no longer in availability) falls back to "all available".
+  // Multi-family MTP keys are cleared the same way as the auto-reset path.
+  useEffect(() => {
+    if (!pendingActiveHwTypes) return;
+    if (pendingHwFilterRef.current) return;
+    if (hwTypesWithData.size === 0) return;
+    // Match exact hwKeys (URL-restored) AND bare GPU prefixes (used by
+    // /compare/[a]-vs-[b] pages, which know the GPU key but not which framework
+    // configs exist for it).
+    const prefixes = [...pendingActiveHwTypes].filter((k) => !k.includes('_'));
+    let restored = new Set(
+      [...hwTypesWithData].filter(
+        (k) =>
+          pendingActiveHwTypes.has(k) || prefixes.some((p) => k.startsWith(`${p}_`) || k === p),
+      ),
+    );
+    // Empty intersection (e.g. URL referenced GPUs no longer in availability,
+    // or the URL only contained multi-family MTP keys that get sanitized away)
+    // → fall back to the default "all available" set. MTP sanitization is then
+    // applied below so the fallback itself is engine-exclusion safe.
+    if (restored.size === 0) restored = hwTypesWithData;
+    if (exclusion) {
+      const cleared = clearAllExclusionGroups(restored, exclusion);
+      restored = cleared.result;
+      if (cleared.droppedGroups.length > 0) {
+        setMtpConflict({ kind: 'cleared', families: cleared.droppedGroups });
+      }
+    }
+    setActiveHwTypes(restored);
+    lastHwResetKeyRef.current = `${selectedModel}|${effectiveSequence}|${precisionsKey}`;
+    setPendingActiveHwTypes(null);
+  }, [
+    pendingActiveHwTypes,
+    hwTypesWithData,
+    exclusion,
+    selectedModel,
+    effectiveSequence,
+    precisionsKey,
+    setActiveHwTypes,
+  ]);
+
   useEffect(() => {
     if (pendingHwFilterRef.current) return;
+    if (pendingActiveHwTypes) return;
     if (hwTypesWithData.size === 0) return;
     const key = `${selectedModel}|${effectiveSequence}|${precisionsKey}`;
     if (lastHwResetKeyRef.current === key) return;
     lastHwResetKeyRef.current = key;
     const presetFilter = presetHwFilterRef.current;
     if (presetFilter) {
-      const filterSet = new Set(presetFilter);
-      const filtered = new Set([...hwTypesWithData].filter((k) => filterSet.has(k)));
+      const filtered = new Set(
+        [...hwTypesWithData].filter((k) => matchesPresetHwFilter(k, presetFilter, selectedModel)),
+      );
       if (filtered.size > 0) {
         // Presets explicitly chose hw configs — respect their picks. The
-        // user-toggle guard still prevents simultaneously activating two
-        // engine families' MTP via subsequent clicks.
+        // matcher already excludes rule-suffix keys under bare prefixes for
+        // models with an exclusion rule, so we don't fall through to
+        // clearAllExclusionGroups (which would fire the toast). The legend
+        // toggle guard still blocks adding a second comparability group later.
         setActiveHwTypes(filtered);
         return;
       }
     }
-    if (mtpExclusion) {
-      // When multiple engine families' MTP have data, disable them all by
-      // default and surface a toast. The user has to opt in to one engine's
-      // MTP explicitly — never multiple at once.
-      const { result, droppedFamilies } = clearAllMtpFamilies(hwTypesWithData);
+    if (exclusion) {
+      // When multiple comparability groups have data, disable them all by
+      // default and surface a toast. The user has to opt into one group
+      // explicitly — never multiple at once.
+      const { result, droppedGroups } = clearAllExclusionGroups(hwTypesWithData, exclusion);
       setActiveHwTypes(result);
-      if (droppedFamilies.length > 0) {
-        setMtpConflict({ kind: 'cleared', families: droppedFamilies });
+      if (droppedGroups.length > 0) {
+        setMtpConflict({ kind: 'cleared', families: droppedGroups });
       }
       return;
     }
     setActiveHwTypes(hwTypesWithData);
-  }, [selectedModel, effectiveSequence, precisionsKey, hwTypesWithData, mtpExclusion]);
+  }, [
+    selectedModel,
+    effectiveSequence,
+    precisionsKey,
+    hwTypesWithData,
+    exclusion,
+    pendingActiveHwTypes,
+  ]);
 
   // Remove selected GPUs that no longer have data for current filters
   useEffect(() => {
@@ -572,9 +694,9 @@ export function InferenceProvider({
   }, [allDateIds, setActiveDates]);
 
   useEffect(() => {
-    if (selectedYAxisMetric !== 'y_costUser') setUserCosts((prev) => (prev !== null ? null : prev));
+    if (selectedYAxisMetric !== 'y_costUser') setUserCosts((prev) => (prev === null ? prev : null));
     if (selectedYAxisMetric !== 'y_powerUser')
-      setUserPowers((prev) => (prev !== null ? null : prev));
+      setUserPowers((prev) => (prev === null ? prev : null));
   }, [selectedModel, effectiveSequence, effectivePrecisions, selectedYAxisMetric]);
 
   const modelPrefixes = useMemo(
@@ -643,6 +765,23 @@ export function InferenceProvider({
 
   // ── URL sync ──────────────────────────────────────────────────────────────
 
+  // Serialize the legend-active set, omitting (empty string → URL default) when
+  // it equals the full set of items with data. Keeps share URLs short.
+  const iActiveStr = useMemo(() => {
+    if (activeHwTypes.size === 0) return '';
+    if (activeHwTypes.size === hwTypesWithData.size) {
+      let same = true;
+      for (const k of activeHwTypes) {
+        if (!hwTypesWithData.has(k)) {
+          same = false;
+          break;
+        }
+      }
+      if (same) return '';
+    }
+    return [...activeHwTypes].toSorted().join(',');
+  }, [activeHwTypes, hwTypesWithData]);
+
   useUrlStateSync(
     {
       i_metric: selectedYAxisMetric,
@@ -661,6 +800,9 @@ export function InferenceProvider({
       i_advlabel: useAdvancedLabels ? '1' : '',
       i_gradlabel: showGradientLabels ? '1' : '',
       i_linelabel: showLineLabels ? '1' : '',
+      i_speed: showSpeedOverlay ? '1' : '',
+      i_mc: showMinecraftOverlay ? '1' : '',
+      i_active: iActiveStr,
     },
     [
       selectedYAxisMetric,
@@ -678,6 +820,9 @@ export function InferenceProvider({
       useAdvancedLabels,
       showGradientLabels,
       showLineLabels,
+      showSpeedOverlay,
+      showMinecraftOverlay,
+      iActiveStr,
     ],
   );
 
@@ -873,6 +1018,10 @@ export function InferenceProvider({
       setShowGradientLabels,
       showLineLabels,
       setShowLineLabels,
+      showSpeedOverlay,
+      setShowSpeedOverlay,
+      showMinecraftOverlay,
+      setShowMinecraftOverlay,
       trackedConfigs,
       addTrackedConfig,
       removeTrackedConfig,
@@ -881,6 +1030,7 @@ export function InferenceProvider({
       activePresetId,
       setActivePresetId,
       presetGuardRef,
+      compareGpuPair: compareGpuPair ?? null,
     }),
     [
       activeHwTypes,
@@ -925,6 +1075,8 @@ export function InferenceProvider({
       useAdvancedLabels,
       showGradientLabels,
       showLineLabels,
+      showSpeedOverlay,
+      showMinecraftOverlay,
       userCosts,
       userPowers,
       trackedConfigs,
@@ -932,6 +1084,7 @@ export function InferenceProvider({
       removeTrackedConfig,
       clearTrackedConfigs,
       activePresetId,
+      compareGpuPair,
     ],
   );
 

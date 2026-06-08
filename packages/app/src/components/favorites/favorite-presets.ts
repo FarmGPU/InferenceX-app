@@ -1,5 +1,5 @@
 import type { BenchmarkRow } from '@/lib/api';
-import { Model, Sequence } from '@/lib/data-mappings';
+import { getModelExclusion, Model, Sequence } from '@/lib/data-mappings';
 
 export interface FavoritePreset {
   id: string;
@@ -20,6 +20,27 @@ export interface FavoritePreset {
     useDateRange?: boolean;
     dateRangeMonths?: number;
   };
+}
+
+/**
+ * Match an hwKey against a preset's hwFilter. Exact entries always match
+ * exactly (so MTP keys like `h100_dynamo-trt_mtp` can be explicitly opted in).
+ * Bare GPU prefixes (no underscore) match any framework variant on that GPU,
+ * but for models with an exclusion rule (currently dsv4 MTP) they also skip
+ * keys matching the rule's suffix — otherwise the preset would surface two
+ * comparability groups on the same chart, which the legend toggle guard already
+ * blocks for explicit user actions.
+ */
+export function matchesPresetHwFilter(
+  hwKey: string,
+  filter: string[],
+  model: Model | string | null | undefined,
+): boolean {
+  const excludedSuffixes = getModelExclusion(model).map((spec) => spec.suffix);
+  const isExcludedVariant = excludedSuffixes.some((suffix) => hwKey.endsWith(suffix));
+  return filter.some(
+    (f) => hwKey === f || (!f.includes('_') && hwKey.startsWith(`${f}_`) && !isExcludedVariant),
+  );
 }
 
 /**

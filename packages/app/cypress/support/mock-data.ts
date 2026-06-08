@@ -82,7 +82,7 @@ export function createMockHardwareConfig(): HardwareConfig {
 
 export function createMockChartDefinition(overrides?: Partial<ChartDefinition>): ChartDefinition {
   return {
-    chartType: 'scatter',
+    chartType: 'e2e',
     heading: 'End-to-End Latency vs Throughput',
     x: 'conc' as keyof AggDataEntry,
     x_label: 'Concurrency',
@@ -211,6 +211,10 @@ export function createMockInferenceContext(
     setShowGradientLabels: namedStub('setShowGradientLabels'),
     showLineLabels: false,
     setShowLineLabels: namedStub('setShowLineLabels'),
+    showSpeedOverlay: false,
+    setShowSpeedOverlay: namedStub('setShowSpeedOverlay'),
+    showMinecraftOverlay: false,
+    setShowMinecraftOverlay: namedStub('setShowMinecraftOverlay'),
     selectedGPUs: [],
     setSelectedGPUs: namedStub('setSelectedGPUs'),
     availableGPUs: [
@@ -246,6 +250,7 @@ export function createMockInferenceContext(
     activePresetId: null,
     setActivePresetId: namedStub('setActivePresetId'),
     presetGuardRef: { current: false } as React.RefObject<boolean>,
+    compareGpuPair: null,
     ...overrides,
   };
 }
@@ -258,8 +263,10 @@ export function createMockEvaluationChartData(
   overrides?: Partial<EvaluationChartData>,
 ): EvaluationChartData {
   return {
+    evalResultId: 1,
     configId: 1,
     hwKey: 'b200_trt' as any,
+    hardware: 'b200',
     configLabel: 'B200 (TRT)',
     score: 87.5,
     scoreError: 1.2,

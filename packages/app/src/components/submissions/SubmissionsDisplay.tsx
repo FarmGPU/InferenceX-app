@@ -8,12 +8,12 @@ import { track } from '@/lib/analytics';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { ChartButtons } from '@/components/ui/chart-buttons';
+import { ChartShareActions } from '@/components/ui/chart-display-helpers';
 import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
-import { ShareButton } from '@/components/ui/share-button';
-import { ShareTwitterButton, ShareLinkedInButton } from '@/components/share-buttons';
 import { exportToCsv } from '@/lib/csv-export';
 import { submissionsVolumeToCsv } from '@/lib/csv-export-helpers';
 import { useSubmissions } from '@/hooks/api/use-submissions';
+import { relockFeatureGate } from '@/lib/use-feature-gate';
 
 import SubmissionsChart, { type ChartMode } from './SubmissionsChart';
 import SubmissionsTable from './SubmissionsTable';
@@ -25,8 +25,6 @@ const SUBMISSIONS_CHART_MODE_OPTIONS: SegmentedToggleOption<ChartMode>[] = [
   { value: 'weekly', label: 'Weekly', testId: 'submissions-weekly-btn' },
   { value: 'cumulative', label: 'Cumulative', testId: 'submissions-cumulative-btn' },
 ];
-
-const FEATURE_GATE_KEY = 'inferencex-feature-gate';
 
 export default function SubmissionsDisplay() {
   const router = useRouter();
@@ -80,8 +78,7 @@ export default function SubmissionsDisplay() {
                 size="sm"
                 className="h-7 gap-1.5 text-xs text-muted-foreground"
                 onClick={() => {
-                  localStorage.removeItem(FEATURE_GATE_KEY);
-                  window.dispatchEvent(new Event('inferencex:feature-gate:locked'));
+                  relockFeatureGate();
                   track('submissions_relocked');
                   router.push('/inference');
                 }}
@@ -90,11 +87,7 @@ export default function SubmissionsDisplay() {
                 <Lock className="size-3" />
                 Re-lock feature gate
               </Button>
-              <ShareButton />
-              <div className="hidden sm:flex items-center gap-1.5">
-                <ShareTwitterButton />
-                <ShareLinkedInButton />
-              </div>
+              <ChartShareActions />
             </div>
           </div>
         </Card>

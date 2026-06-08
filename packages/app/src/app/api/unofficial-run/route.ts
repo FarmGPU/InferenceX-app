@@ -55,6 +55,9 @@ export function normalizeArtifactRows(
       conc: params.conc,
       image: params.image,
       metrics: params.metrics,
+      // Surface the same per-worker payload the DB path emits so unofficial
+      // overlays carry the multinode measured-power breakdown too.
+      workers: params.workers,
       date,
       run_url: runUrl,
     });
@@ -116,6 +119,10 @@ export function normalizeEvalArtifactRows(
     }
 
     rows.push({
+      // Synthetic id — unofficial rows are never persisted to eval_results, so
+      // there's no real PK to surface. -1 signals "no DB-side row" to the
+      // samples drawer (it'll skip the DB lookup and fall back to live fetch).
+      id: -1,
       config_id: configIdOffset + localId,
       hardware: params.config.hardware,
       framework: params.config.framework,
@@ -181,7 +188,7 @@ function parseRunIds(raw: string | null): { ids: string[]; error: string | null 
         .filter(Boolean),
     ),
   ];
-  if (ids.length === 0 || !ids.every((id) => /^\d+$/.test(id))) {
+  if (ids.length === 0 || !ids.every((id) => /^\d+$/u.test(id))) {
     return { ids: [], error: 'runId must be a comma-separated list of numeric values' };
   }
   return { ids, error: null };

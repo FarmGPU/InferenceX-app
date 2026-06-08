@@ -32,7 +32,7 @@ export const Footer = ({ starCount }: { starCount?: number | null }) => (
           >
             Continuous open-source inference benchmarking. Real-world, reproducible, auditable
             performance data trusted by trillion dollar AI infrastructure operators like OpenAI,
-            Oracle, Microsoft, etc.
+            Meta, Oracle, Microsoft, etc.
           </p>
         </div>
 
@@ -125,6 +125,13 @@ export const Footer = ({ starCount }: { starCount?: number | null }) => (
               className="text-sm text-muted-foreground hover:text-foreground transition-colors"
             >
               GPU Reliability
+            </Link>
+            <Link
+              data-testid="footer-link-compare-per-dollar"
+              href="/compare-per-dollar"
+              className="text-sm text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Performance per Dollar
             </Link>
           </div>
         </div>

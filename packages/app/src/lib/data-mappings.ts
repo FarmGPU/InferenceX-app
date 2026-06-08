@@ -1,3 +1,5 @@
+import type { ExclusionSpec } from './exclusion';
+
 export enum Model {
   Llama3_3_70B = 'Llama-3.3-70B-Instruct-FP8',
   Llama3_1_70B = 'Llama-3.1-70B-Instruct-FP8-KV',
@@ -42,35 +44,54 @@ interface ModelConfig {
   prefix: string;
   category: CategoryTag;
   /**
-   * If true, MTP configs from different engine families (e.g. vLLM and SGLang)
-   * cannot be active simultaneously, since their acceptance-rate forcing
-   * implementations differ and aren't directly comparable on the same graph.
+   * Data-driven exclusion rules for this model (see `exclusion.ts`). Each spec
+   * partitions matching config keys into comparability groups that can't share
+   * a graph with each other. Absent/empty = no exclusion.
    */
-  mtpEngineExclusion?: boolean;
+  exclusion?: ExclusionSpec[];
 }
 
+/**
+ * dsv4 MTP exclusion: MTP configs (`*_mtp`) from different engine families can't
+ * be active together because their acceptance-rate forcing implementations
+ * differ. ATOM and SGLang share the upstream ROCm MTP path, so they form one
+ * comparability group; vLLM is its own group.
+ */
+const MTP_ENGINE_EXCLUSION: ExclusionSpec[] = [
+  { suffix: '_mtp', stripPrefixes: ['dynamo-', 'mori-'], groupAliases: { atom: 'sglang' } },
+];
+
+// Total parameter counts appended to each label so users can compare model
+// scale at a glance in the dropdown. For Llama and gpt-oss the count is
+// already part of the canonical name (Llama 3.3 70B, gpt-oss 120B) so no
+// duplication needed.
 const MODEL_CONFIG: Record<Model, ModelConfig> = {
-  [Model.DeepSeek_R1]: { label: 'DeepSeek R1 0528', prefix: 'dsr1', category: 'default' },
+  [Model.DeepSeek_R1]: { label: 'DeepSeek R1 0528 671B', prefix: 'dsr1', category: 'default' },
   [Model.DeepSeek_V4_Pro]: {
-    label: 'DeepSeek V4 Pro',
+    label: 'DeepSeek V4 Pro 1.6T',
     prefix: 'dsv4',
-    category: 'experimental',
-    mtpEngineExclusion: true,
+    category: 'default',
+    exclusion: MTP_ENGINE_EXCLUSION,
   },
   [Model.Kimi_K2_5]: {
-    label: 'Kimi K2.5',
+    // K2.5 and K2.6 share an architecture, so the dropdown surfaces both
+    // versions joined with a slash — matches the GLM5/5.1 pattern. The
+    // hyphenated `Model.Kimi_K2_5` enum value stays as-is for internal
+    // routing / DB key mapping.
+    label: 'Kimi K2.5/2.6 1T',
     prefix: 'kimik2.5',
     category: 'default',
   },
-  [Model.Qwen3_5]: { label: 'Qwen3.5', prefix: 'qwen3.5', category: 'default' },
-  [Model.GLM_5]: { label: 'GLM5/5.1', prefix: 'glm5', category: 'default' },
+  [Model.Qwen3_5]: { label: 'Qwen3.5 397B', prefix: 'qwen3.5', category: 'default' },
+  [Model.GLM_5]: { label: 'GLM5/5.1 744B', prefix: 'glm5', category: 'default' },
   [Model.GLM_4_7]: {
     label: 'GLM-4.7 (Gaudi 3 preview)',
     prefix: 'glm4.7',
     category: 'experimental',
   },
   [Model.MiniMax_M2_5]: {
-    label: 'MiniMax M2.5',
+    // M2.5 and M2.7 share an architecture — same GLM5/5.1 pattern as Kimi.
+    label: 'MiniMax M2.5/2.7 230B',
     prefix: 'minimaxm2.5',
     category: 'default',
   },
@@ -114,26 +135,25 @@ export function getModelLabel(model: Model): string {
 }
 
 /**
- * True if the model enforces the rule that MTP configs from different engine
- * families can't be shown on the same graph.
+ * Exclusion specs configured for a model (see `exclusion.ts`). Empty when the
+ * model has no exclusion rules.
  */
-export function hasMtpEngineExclusion(model: Model | string | null | undefined): boolean {
-  if (!model) return false;
-  return MODEL_CONFIG[model as Model]?.mtpEngineExclusion === true;
+export function getModelExclusion(model: Model | string | null | undefined): ExclusionSpec[] {
+  if (!model) return [];
+  return MODEL_CONFIG[model as Model]?.exclusion ?? [];
+}
+
+/** True if the model has any config-exclusion rule. */
+export function hasExclusion(model: Model | string | null | undefined): boolean {
+  return getModelExclusion(model).length > 0;
 }
 
 /**
- * Pick the chart watermark for a given model + run state. Unofficial-run charts
- * always get the red "UNOFFICIAL" banner; otherwise dsv4 (day-0 support) gets
- * the blue "EXPERIMENTAL - DAY ZERO" banner; everything else gets the logo.
+ * Pick the chart watermark for a given run state. Unofficial-run charts get
+ * the red "UNOFFICIAL" banner; everything else gets the logo.
  */
-export function getModelWatermark(
-  model: Model | string | null | undefined,
-  isUnofficialRun = false,
-): 'logo' | 'unofficial' | 'day0' {
-  if (isUnofficialRun) return 'unofficial';
-  if (model === Model.DeepSeek_V4_Pro) return 'day0';
-  return 'logo';
+export function getChartWatermark(isUnofficialRun = false): 'logo' | 'unofficial' {
+  return isUnofficialRun ? 'unofficial' : 'logo';
 }
 
 export const MODEL_PREFIX_MAPPING: Record<string, Model> = Object.fromEntries(

@@ -9,12 +9,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import ChartLegend from '@/components/ui/chart-legend';
+import { ChartShareActions } from '@/components/ui/chart-display-helpers';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { SegmentedToggle, type SegmentedToggleOption } from '@/components/ui/segmented-toggle';
-import { ShareButton } from '@/components/ui/share-button';
 import { UnofficialDomainNotice } from '@/components/ui/unofficial-domain-notice';
-import { ShareTwitterButton, ShareLinkedInButton } from '@/components/share-buttons';
 import {
   Select,
   SelectContent,
@@ -22,6 +21,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+
+import { relockFeatureGate } from '@/lib/use-feature-gate';
 
 import GpuCorrelationChart from './GpuCorrelationChart';
 import GpuMetricsChart from './GpuPowerChart';
@@ -36,7 +37,6 @@ import {
 } from './types';
 
 const GPU_COLORS = d3.schemeTableau10;
-const FEATURE_GATE_KEY = 'inferencex-feature-gate';
 
 type GpuMetricsView = 'chart' | 'correlation';
 
@@ -249,8 +249,7 @@ export default function GpuMetricsDisplay() {
                 size="sm"
                 className="h-7 gap-1.5 text-xs text-muted-foreground"
                 onClick={() => {
-                  localStorage.removeItem(FEATURE_GATE_KEY);
-                  window.dispatchEvent(new Event('inferencex:feature-gate:locked'));
+                  relockFeatureGate();
                   track('powerx_relocked');
                   router.push('/inference');
                 }}
@@ -259,11 +258,7 @@ export default function GpuMetricsDisplay() {
                 <Lock className="size-3" />
                 Re-lock feature gate
               </Button>
-              <ShareButton />
-              <div className="hidden sm:flex items-center gap-1.5">
-                <ShareTwitterButton />
-                <ShareLinkedInButton />
-              </div>
+              <ChartShareActions />
             </div>
           </div>
           <div className="flex flex-wrap items-end gap-3">
@@ -491,15 +486,15 @@ export default function GpuMetricsDisplay() {
                       track('gpu_metrics_legend_expanded', { expanded });
                     }}
                     actions={
-                      !allGpusSelected
-                        ? [
+                      allGpusSelected
+                        ? []
+                        : [
                             {
                               id: 'gpu-metrics-reset-filter',
                               label: 'Reset filter',
                               onClick: selectAllGpus,
                             },
                           ]
-                        : []
                     }
                     switches={[
                       {
@@ -547,15 +542,15 @@ export default function GpuMetricsDisplay() {
                       track('gpu_metrics_legend_expanded', { expanded });
                     }}
                     actions={
-                      !allGpusSelected
-                        ? [
+                      allGpusSelected
+                        ? []
+                        : [
                             {
                               id: 'gpu-metrics-reset-filter-2',
                               label: 'Reset filter',
                               onClick: selectAllGpus,
                             },
                           ]
-                        : []
                     }
                     switches={[
                       {

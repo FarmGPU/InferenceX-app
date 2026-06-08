@@ -46,12 +46,14 @@ import {
 } from './etl/benchmark-ingest';
 import { mapEvalRow, mapAggEvalRow, type EvalParams } from './etl/eval-mapper';
 import { ingestEvalRow } from './etl/eval-ingest';
+import { mapEvalSamples } from './etl/eval-samples-mapper';
+import { bulkIngestEvalSamples } from './etl/eval-samples-ingest';
 import {
   parseChangelogEntries,
   ingestChangelogEntries,
   hasEvalsOnlyFlag,
 } from './etl/changelog-ingest';
-import { readZipJson, readZipJsonMap, readZipText } from './etl/zip-reader';
+import { readZipJson, readZipJsonMap, readZipText, readZipTextsMatching } from './etl/zip-reader';
 
 const GCS_DIR = path.join(import.meta.dirname, '..', '..', '..', 'gcs');
 const CONCURRENCY = 20;
@@ -79,7 +81,11 @@ interface WorkflowMapResult {
   /** Per-ZIP benchmark rows, ready for configId lookup + bulk insert in phase 2. */
   bmkZips: { zipFile: string; rows: BenchmarkParams[]; serverLogPath?: string }[];
   statsRows: { hardware: string; nSuccess: number; total: number }[];
-  evalRows: EvalParams[];
+  /**
+   * Each eval row carries the matching `samples_<task>_*.jsonl` text when the
+   * source ZIP includes it (per-config eval ZIPs do; agg ZIPs don't).
+   */
+  evalRows: { params: EvalParams; samplesText: string | null }[];
   changelogs: { baseRef: string; headRef: string; entries: ChangelogEntry[] }[];
   /** True when the changelog declares evals-only — benchmark/stats data is dropped. */
   evalsOnly: boolean;
@@ -97,6 +103,7 @@ interface WriteResult {
   newStats: number;
   dupStats: number;
   evals: number;
+  evalSamples: number;
   changelogs: number;
   warnings: string[];
   localSkips: Omit<Skips, 'dbError'>;
@@ -176,7 +183,7 @@ async function mapWorkflowDir(
     }
   }
   if (!githubRunId) {
-    const match = workflowDir.match(/_(\d{10,})$/);
+    const match = workflowDir.match(/_(\d{10,})$/u);
     if (match) githubRunId = parseInt(match[1], 10);
   }
   if (!githubRunId) {
@@ -216,7 +223,7 @@ async function mapWorkflowDir(
   const islOslFallback = parseIslOsl(workflowDir);
   const runName =
     workflowDir
-      .replace(/_\d{10,}$/, '')
+      .replace(/_\d{10,}$/u, '')
       .replaceAll('_', ' ')
       .trim() || `Run ${githubRunId}`;
 
@@ -231,7 +238,7 @@ async function mapWorkflowDir(
   // Map configKey → zip file path. Actual text is read lazily in phase 2.
   const serverLogPaths = new Map<string, string>();
   for (const zipFile of serverLogZips) {
-    const configKey = zipFile.replace(/^server_logs_/, '').replace(/_\d+_\d+\.zip$/, '');
+    const configKey = zipFile.replace(/^server_logs_/u, '').replace(/_\d+_\d+\.zip$/u, '');
     serverLogPaths.set(configKey, path.join(artifactsPath, zipFile));
   }
 
@@ -240,8 +247,8 @@ async function mapWorkflowDir(
   // artifacts map to the same DB conflict key, the newest is processed last
   // and wins the ON CONFLICT DO UPDATE (latest-attempt-wins).
   const sortedBmkZips = [...bmkZipFiles].toSorted((a, b) => {
-    const idA = a.match(/_(\d{10,})\.zip$/)?.[1];
-    const idB = b.match(/_(\d{10,})\.zip$/)?.[1];
+    const idA = a.match(/_(\d{10,})\.zip$/u)?.[1];
+    const idB = b.match(/_(\d{10,})\.zip$/u)?.[1];
     const tsA = idA ? (artifactCreatedAt.get(Number(idA)) ?? '') : '';
     const tsB = idB ? (artifactCreatedAt.get(Number(idB)) ?? '') : '';
     return tsA.localeCompare(tsB);
@@ -295,7 +302,7 @@ async function mapWorkflowDir(
       // Match server log by config key (bmk_ files only — results_ compiled zips have no matching logs)
       let serverLogPath: string | undefined;
       if (zipFile.startsWith('bmk_')) {
-        const bmkConfigKey = zipFile.replace(/^bmk_/, '').replace(/_\d+_\d+\.zip$/, '');
+        const bmkConfigKey = zipFile.replace(/^bmk_/u, '').replace(/_\d+_\d+\.zip$/u, '');
         serverLogPath = serverLogPaths.get(bmkConfigKey);
       }
       bmkZips.push({ zipFile, rows, serverLogPath });
@@ -319,9 +326,10 @@ async function mapWorkflowDir(
   }
 
   // ── Map individual eval ZIPs ──────────────────────────────────────────────
-  const evalRows: EvalParams[] = [];
+  const evalRows: WorkflowMapResult['evalRows'] = [];
   for (const zipFile of evalZips) {
-    const files = readZipJsonMap(path.join(artifactsPath, zipFile));
+    const zipPath = path.join(artifactsPath, zipFile);
+    const files = readZipJsonMap(zipPath);
     if (!files) {
       local.skips.badZip++;
       warnings.push(`  [WARN] ${dateDir}/${zipFile}: bad/empty zip — skipped`);
@@ -357,7 +365,22 @@ async function mapWorkflowDir(
       );
       continue;
     }
-    evalRows.push(...mapped);
+
+    // lm-eval names sample files `samples_<task>_<timestamp>.jsonl`. Pull
+    // them all and key by lowercased task to match `EvalParams.task`.
+    const sampleTexts = readZipTextsMatching(
+      zipPath,
+      (n) => n.startsWith('samples_') && n.endsWith('.jsonl'),
+    );
+    const samplesByTask = new Map<string, string>();
+    for (const [name, text] of sampleTexts) {
+      const m = name.match(/^samples_(.+?)_[^_]+\.jsonl$/u);
+      if (m) samplesByTask.set(m[1].toLowerCase(), text);
+    }
+
+    for (const params of mapped) {
+      evalRows.push({ params, samplesText: samplesByTask.get(params.task) ?? null });
+    }
   }
 
   // ── Map compiled eval ZIPs ────────────────────────────────────────────────
@@ -388,7 +411,7 @@ async function mapWorkflowDir(
         );
         continue;
       }
-      evalRows.push(mapped);
+      evalRows.push({ params: mapped, samplesText: null });
     }
   }
 
@@ -478,7 +501,7 @@ async function main(): Promise<void> {
 
   const dateDirs = fs
     .readdirSync(GCS_DIR)
-    .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    .filter((d) => /^\d{4}-\d{2}-\d{2}$/u.test(d))
     .toSorted();
   console.log(`  ${dateDirs.length} date directories  (${dateDirs[0]} → ${dateDirs.at(-1)})`);
 
@@ -526,6 +549,7 @@ async function main(): Promise<void> {
   let totalNewStats = 0,
     totalDupStats = 0;
   let totalEvals = 0,
+    totalEvalSamples = 0,
     totalChangelogs = 0;
 
   async function writeWorkflowResult(result: WorkflowMapResult): Promise<WriteResult> {
@@ -535,6 +559,7 @@ async function main(): Promise<void> {
       newStats: 0,
       dupStats: 0,
       evals: 0,
+      evalSamples: 0,
       changelogs: 0,
       warnings: result.warnings,
       localSkips: result.localSkips,
@@ -639,16 +664,24 @@ async function main(): Promise<void> {
       }
     }
 
-    for (const p of result.evalRows) {
+    for (const { params, samplesText } of result.evalRows) {
       try {
-        const outcome = await ingestEvalRow(
+        const { outcome, id: evalResultId } = await ingestEvalRow(
           sql,
           getOrCreateConfig,
-          p,
+          params,
           workflowRunId,
           result.dateDir,
         );
         if (outcome === 'new') wr.evals++;
+
+        if (samplesText) {
+          const samples = mapEvalSamples(samplesText, tracker);
+          if (samples.length > 0) {
+            const { newCount } = await bulkIngestEvalSamples(sql, evalResultId, samples);
+            wr.evalSamples += newCount;
+          }
+        }
       } catch (error: any) {
         tracker.recordDbError('eval row', error);
       }
@@ -694,6 +727,7 @@ async function main(): Promise<void> {
     newStats: number;
     dupStats: number;
     evals: number;
+    evalSamples: number;
     changelogs: number;
     warnings: string[];
   }
@@ -715,6 +749,7 @@ async function main(): Promise<void> {
     totalNewStats += wr.newStats;
     totalDupStats += wr.dupStats;
     totalEvals += wr.evals;
+    totalEvalSamples += wr.evalSamples;
     totalChangelogs += wr.changelogs;
 
     const acc: DateTotal = dateTotals.get(result.dateDir) ?? {
@@ -723,6 +758,7 @@ async function main(): Promise<void> {
       newStats: 0,
       dupStats: 0,
       evals: 0,
+      evalSamples: 0,
       changelogs: 0,
       warnings: [],
     };
@@ -731,6 +767,7 @@ async function main(): Promise<void> {
     acc.newStats += wr.newStats;
     acc.dupStats += wr.dupStats;
     acc.evals += wr.evals;
+    acc.evalSamples += wr.evalSamples;
     acc.changelogs += wr.changelogs;
     acc.warnings.push(...wr.warnings);
     dateTotals.set(result.dateDir, acc);
@@ -753,6 +790,7 @@ async function main(): Promise<void> {
       );
     }
     if (acc.evals > 0) parts.push(`+${acc.evals} eval`);
+    if (acc.evalSamples > 0) parts.push(`+${acc.evalSamples} samples`);
     if (acc.changelogs > 0) parts.push(`+${acc.changelogs} changelog`);
     if (parts.length > 0) console.log(`  ${dateDir}  ${parts.join('  ')}`);
   }
@@ -773,6 +811,7 @@ async function main(): Promise<void> {
   const [resultCount] = await sql`select count(*)::int as n from benchmark_results`;
   const [statsCount] = await sql`select count(*)::int as n from run_stats`;
   const [evalCount] = await sql`select count(*)::int as n from eval_results`;
+  const [sampleCount] = await sql`select count(*)::bigint as n from eval_samples`;
   const [changelogCount] = await sql`select count(*)::int as n from changelog_entries`;
 
   console.log('\n=== Summary ===');
@@ -783,12 +822,14 @@ async function main(): Promise<void> {
     `  Run stats:         ${totalNewStats} new, ${totalDupStats} duplicate (ON CONFLICT updates)`,
   );
   console.log(`  Eval results:      ${totalEvals} new`);
+  console.log(`  Eval samples:      ${totalEvalSamples} new`);
   console.log(`  Changelog entries: ${totalChangelogs} new`);
   console.log(`\n  DB totals:`);
   console.log(`    configs           ${configCount.n}`);
   console.log(`    benchmark_results ${resultCount.n}`);
   console.log(`    run_stats         ${statsCount.n}`);
   console.log(`    eval_results      ${evalCount.n}`);
+  console.log(`    eval_samples      ${sampleCount.n}`);
   console.log(`    changelog_entries ${changelogCount.n}`);
 
   const { skips, unmappedModels, unmappedHws } = tracker;
@@ -821,6 +862,7 @@ async function main(): Promise<void> {
   }
 
   console.log('\n=== db:ingest:gcs complete ===');
+  console.log('  Invalidate API cache: pnpm admin:cache:invalidate');
 }
 
 main()
